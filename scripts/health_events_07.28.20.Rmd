@@ -1,0 +1,1265 @@
+---
+title: "Maintaining Sense of Purpose Following Health Adversity in Older Adulthood: A Propensity Score Matching Examination"
+author: 
+- "Patrick L Hill"
+- "Emorie D Beck"
+- "Joshua J Jackson"
+output:
+  html_document:
+    number_sections: no
+    theme: united
+    highlight: tango
+    df_print: paged
+    code_folding: show
+    toc: true
+    toc_float: true
+    toc_depth: 3
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F, error = F)
+```
+
+#Workspace
+##Packages
+
+```{r}
+library(survey)
+library(mi)
+library(psych)
+library(MatchIt)
+library(brms)
+library(MuMIn)
+library(googlesheets)
+library(parallel)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(stargazer)
+library(plyr)
+library(stringr)
+library(haven)
+library(tidyverse)
+
+data_path <- "~/Box/network/other projects/health events"
+res_path <- "~/Box/Purpose and Health Events"
+```
+
+
+
+# Data
+## Load Raw Data
+
+```{r load codebook, eval = T}
+# load google sheet containing variable names, recoding, etc #
+dat <- sprintf("%s/HRS_codebook.xlsx", res_path) %>% 
+  readxl::read_xlsx(.) %>%
+  filter(Include == "Yes") %>%
+  mutate(Item = ifelse(Dataset == "Rand", str_to_lower(Item), str_to_upper(Item)),
+         Item = str_replace_all(Item, "[[:space:]]", ""),
+         new_name = str_replace_all(new_name, "[[:space:]]", ""))
+
+# load(sprintf("%s/data/raw_data.RData", data_path))
+```
+
+```{r read data, eval = F}
+dem.old <- (dat %>% filter(Dataset == "Rand" & Type == "demographic"))$Item
+dem.new <- (dat %>% filter(Dataset == "Rand" & Type == "demographic"))$new_name
+
+old.names <- (dat %>% filter(Dataset == "Rand" & Type != "demographic"))$Item
+new.names <- (dat %>% filter(Dataset == "Rand" & Type != "demographic"))$new_name
+
+hrs.rand <- haven::read_sav(sprintf("%s/data/rndhrs_p.sav", data_path)) %>%
+  tbl_df() %>%
+  select(one_of(dem.old), one_of(old.names)) %>%
+  setNames(c(dem.new, new.names)) 
+
+match.dat <- hrs.rand %>%
+  gather(key = new_name, value = value, -PROC_CID, -DemDOB, -DemDeath, -DemGender, 
+         -DemRace_all.1992, -DemRace_hispan.1992) %>%
+  full_join(dat %>% filter(Dataset == "Rand" & Type == "matching") %>% 
+              select(new_name, Wave, Type, rule, rev_code, mini, maxi, recode)) %>%
+  filter(is.na(DemDeath) == T | DemDeath > 2006)
+
+old.names <- (dat %>% filter(Dataset == "PLB"))$Item
+new.names <- (dat %>% filter(Dataset == "PLB"))$new_name
+
+
+read_fun <- function(year) {
+  read_da <- function(da, dct, year){
+    print(paste(da, dct, year, sep = " "))
+    data.file <- sprintf("%s/data/%s/%s", data_path, year, da)
+    # Set path to the dictionary file "*.DCT"
+    dict.file <- sprintf("%s/data/%s/%s", data_path, year, dct)
+    # Read the dictionary file
+    df.dict <- read.table(dict.file, skip = 1, fill = TRUE, stringsAsFactors = FALSE)
+    # Set column names for dictionary dataframe
+    colnames(df.dict) <- c("col.num","col.type","col.name","col.width","col.lbl")
+    # Remove last row which only contains a closing }
+    row <- which(df.dict$col.name == "HHID")
+    df.dict <- df.dict[-nrow(df.dict),]
+    if(row == 2){df.dict <- df.dict[-1,]}
+    # Extract numeric value from column width field
+    df.dict$col.width <- as.integer(sapply(df.dict$col.width, gsub, pattern = "[^0-9\\.]", replacement = ""))
+    # Convert column types to format to be used with read_fwf function
+    df.dict$col.type <- sapply(df.dict$col.type, function(x) ifelse(x %in% c("int","byte","long"), "i", ifelse(x == "float", "n", ifelse(x == "double", "d", "c"))))
+    # Read the data file into a dataframe
+    df <- read_fwf(file = data.file, fwf_widths(widths = df.dict$col.width, col_names = df.dict$col.name), col_types = paste(df.dict$col.type, collapse = ""))
+    # Add column labels to headers
+    attributes(df)$variable.labels <- df.dict$col.lbl
+    if(all(c("PN", "HHID") %in% colnames(df))){
+      df <- df %>%
+      mutate(hhidpn = 1000*as.numeric(HHID) + as.numeric(PN)) %>%
+      select(-HHID, -PN) %>%
+      gather(key = item, value = value, -hhidpn, na.rm = T)
+    } else {df <- NA}
+    return(df)
+  }
+    # Set path to the data file "*.DA"
+  files <- list.files(sprintf("%s/data/%s", data_path, year))
+  df2 <- tibble(
+    da = files[grepl(".da",  files) | grepl(".DA", files)],
+    dct = files[grepl(".dct", files) | grepl(".DCT", files)]
+  ) %>%
+    mutate(data = map2(da, dct, possibly(~read_da(.x, .y, year), NA_real_))) %>%
+    filter(!is.na(data)) %>%
+    unnest(data) %>%
+    select(-da, -dct)
+}
+
+hrs.paq <- tibble(
+  Year = seq(1992,2016,2),
+  new.wave = c(rep(NA,7), rep(seq(1,3,1),each=2))
+) %>%
+  mutate(data = map(Year, read_fun)) %>%
+  unnest(data, .drop = T) %>%
+  rename(PROC_CID = hhidpn) %>%
+  filter(item %in% old.names) %>%
+  mutate(new_name = mapvalues(item, old.names, new.names)) %>%
+  full_join(dat %>% filter(Dataset == "PLB") %>% 
+              select(new_name, Wave, Type, rule, rev_code, mini, maxi, recode)) %>%
+  mutate_at(vars(value, mini, maxi), funs(as.numeric)) %>%
+  group_by(new_name) %>%
+  mutate(value = ifelse(rev_code == 0 | is.na(rev_code) == T, value,
+                        reverse.code(-1, value, mini = mini[1], maxi = maxi[1]))) %>%
+  ungroup() %>%
+  select(-rev_code, -mini, -maxi)
+
+save(match.dat, file = sprintf("%s/data/match_dat.Rdata", data_path))
+save(hrs.paq, file = sprintf("%s/data/hrs.paq.Rdata", data_path))
+```
+
+## Outcome Data
+```{r personality data, eval = F}
+cesd <- hrs.rand %>% select(PROC_CID, contains("CESD")) %>%
+  mutate_all(as.numeric) %>%
+  gather(key = item, value = value, -PROC_CID, na.rm = T) %>%
+  separate(item, c("Trait", "cat"), sep = "_") %>%
+  separate(cat, c("item", "Year"), sep = "[.]") %>%
+  separate(item, c("scrap", "item"), -1) %>%
+  select(-scrap) %>%
+  mutate(new.wave = mapvalues(Year, seq(1992,2016,2), 
+          c(rep(NA,7), rep(seq(1,3,1),each=2)))) %>%
+  filter(Year %in% seq(2006,2016,2)) %>%
+  group_by(PROC_CID) %>%
+  mutate(Year = as.numeric(Year), fy = min(Year, na.rm = T),
+         new.wave = as.numeric(new.wave),
+         new.wave = ifelse(!(fy %in% c(2006,2008)), 
+             new.wave-min(new.wave) + 1, new.wave)) %>%
+  select(PROC_CID, new.wave, Trait, item, value, fy) 
+
+pers.long <- hrs.paq %>%
+  filter(Type == "outcome" & !is.na(value)) %>%
+  select(-Year, -item, -recode) %>%
+  separate(new_name, c("item", "Year"), sep = "[.]") %>%
+  group_by(PROC_CID) %>%
+  mutate(fy = as.numeric(min(Year, na.rm = T)),
+         new.wave = ifelse(!(fy %in% c(2006,2008)), 
+             new.wave-min(new.wave) + 1, new.wave)) %>%
+  select(-Year) %>%
+  separate(item, c("cat", "item"), sep = "_") %>%
+  separate(item, c("Trait", "item"), -1) %>%
+  select(PROC_CID, new.wave, Trait, item, value, fy) %>%
+  full_join(cesd) %>%
+  group_by(PROC_CID, new.wave, Trait, item, fy) %>%
+  summarize(value = mean(value, na.rm = T)) %>%
+  left_join(hrs.rand %>% select(PROC_CID, DemDOB, DemGender)) %>%
+  group_by(PROC_CID, Trait, item) %>%
+  mutate(na = sum(!is.na(value))) %>%
+  ungroup() %>%
+  # recode gender & center age at first BFI wave (2005)
+   # male = 1, female = 2 --> male = 1, female = 0
+  mutate(sex12 = mapvalues(DemGender, c(1,2), c(1,0), warn_missing = F),
+         sex.c = as.numeric(scale(sex12, center = T, scale = F)),
+         age = as.numeric(fy)-DemDOB, 
+         age.c = age - mean(age, na.rm = T),
+         age.c2 = age.c^2, #agec2 = agec^2,
+         age.c3 = age.c^3) #agec3 = agec^3
+
+pers.wide <- pers.long %>%
+  filter(na > 1) %>%
+  mutate(new.wave = paste("T", new.wave, sep = "")) %>%
+  unite(temp, new.wave, item, sep = ".") %>%
+  spread(key = temp, value = value)
+
+pers.match <- pers.long %>%
+  # filter(new.wave == 1) %>%
+  group_by(PROC_CID, new.wave, Trait) %>%
+  summarize(value = mean(value, na.rm = T)) %>%
+  ungroup() %>%
+  unite(Trait, Trait, new.wave, sep = "_") %>%
+  # mutate(Trait = paste(Trait, "W1", sep = "_")) %>%
+  spread(key = Trait, value = value)
+
+pers.long <- pers.long %>% 
+  group_by(new.wave, Trait, PROC_CID, DemDOB, DemGender,
+           sex12, sex.c, age, age.c, age.c2, age.c3) %>%
+  summarise(value = mean(value, na.rm = T))
+```
+
+## Matching Data
+### Combine and Reverse Code
+```{r combine match data, eval = F}
+match.dat <- hrs.rand %>%
+  gather(key = new_name, value = value, -PROC_CID, -DemDOB, -DemDeath, -DemGender, 
+         -DemRace_all.1992, -DemRace_hispan.1992) %>%
+  full_join(dat %>% filter(Dataset == "Rand" & Type == "matching") %>% 
+              select(new_name, Wave, Type, rule, rev_code, mini, maxi, recode)) %>%
+  #filter(is.na(DemDeath) == T | DemDeath < 2006) %>%
+  mutate_at(vars(value, mini, maxi), funs(as.numeric)) %>%
+  group_by(new_name) %>%
+  mutate(value = ifelse(is.na(rev_code) | rev_code == 0, value,
+                        reverse.code(-1, value, mini = mini[1], maxi = maxi[1]))) %>%
+  ungroup() %>%
+  select(-rev_code, -mini, -maxi) %>%
+  full_join(hrs.paq %>%
+    filter(Type == "matching" & !is.na(value)) %>%
+    select(-Year, -Wave, -item)) %>%
+  separate(new_name, c("item", "Year"), sep = "[.]") %>%
+  filter(!is.na(value) & Year <= 2006)
+```
+
+### Recode
+```{r recode matching, eval = F}
+match.dat <- match.dat %>%
+  mutate(value = ifelse(item == "MarStat_rMarStat", mapvalues(value,
+                    from = seq(1,8), to = c(rep(1,3), rep(2,3), 3, 0)), value),
+         # value = ifelse(item %in% c("HBehVigAct_rHBehVigAct", "HBehModAct_rHBehModAct",
+         #                            "HBehLightAct_rHBehLightAct") & value >= 3, 1, value),
+         value = ifelse(item == "Religion_Religion", mapvalues(value, 1:5, c(1,1,2,0,2)), value),
+         value = ifelse(grepl("^LE", item) == T, mapvalues(value, c(1,5), c(1,0)), value))
+```
+
+```{r matching composites, eval = F}
+Mode <- function(x) {
+  ux <- unique(x)
+  ux <- ux[!is.na(ux)]
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+ceil_average <- function(x){
+  ceiling(mean(x, na.rm = T))
+}
+
+sum_fun <- function(df, Rule){
+  fun_call <- function(x, rule){
+    switch(rule,
+           average = mean(x, na.rm = T),
+           mode = Mode(x)[1],
+           sum = sum(x, na.rm = T),
+           select = unique(x)[1],
+           max = max(x, na.rm = T),
+           min = min(x, na.rm = T),
+           ceil_average = ceil_average(x))
+  }
+  df %>%
+    group_by(PROC_CID, item, DemDOB, DemDeath, DemGender, 
+             DemRace_all.1992, DemRace_hispan.1992) %>% 
+    summarize(value = fun_call(value, Rule)) %>% 
+    mutate(value = ifelse(is.nan(value) == T, NA,
+                 ifelse(is.infinite(value) == T, NA, value))) %>%
+    ungroup()
+}
+
+match.dat.wide <- match.dat %>%
+  filter(Type == "matching" & (DemDeath > 2006 | is.na(DemDeath))) %>%
+  group_by(rule) %>%
+  nest() %>%
+  mutate(data = map2(data, rule, possibly(sum_fun, NA_real_))) %>%
+  unnest(data, .drop = T) %>%
+  separate(item, c("item", "scrap")) %>%
+  group_by(rule) %>%
+  nest() %>%
+  mutate(data = map2(data, rule, possibly(sum_fun, NA_real_))) %>%
+  unnest(data, .drop = T)  %>%
+  group_by(PROC_CID) %>%
+  mutate_at(vars(DemDOB:DemRace_hispan.1992), funs(max(., na.rm = T))) %>%
+  mutate_at(vars(DemDOB:DemRace_hispan.1992), funs(ifelse(is.infinite(.) == T, NA_real_, .))) 
+match.dat.wide <- match.dat.wide %>%
+  select(PROC_CID, item, value) %>% # get rid of the rule variables
+  spread(key = item, value = value) %>% # change to wide format 
+  full_join(unique(match.dat.wide %>% select(PROC_CID, DemDOB:DemRace_hispan.1992))) %>%
+  mutate(DemRace = DemRace_all.1992,
+         DemRace = ifelse(DemRace_hispan.1992 == 1, 3, DemRace)) %>%
+  select(-DemRace_hispan.1992, -DemRace_all.1992)
+
+match.dat.wide <- match.dat.wide %>%
+  full_join(pers.match)
+```
+
+
+## Grouping Data
+```{r health event data, eval = F}
+new.names <- (dat %>% filter(Dataset == "Rand" & Type == "grouping"))$new_name
+years <- seq(1992,2016,2)
+new.waves <-  c(rep(NA,7), rep(seq(1,3,1),each=2))
+               
+grouping.dat <- hrs.rand %>%
+  select(PROC_CID:DemDeath, one_of(new.names)) %>%
+  gather(key = new_name, value = value, -PROC_CID, -DemDOB, -DemDeath, na.rm = T) %>%
+  full_join(dat %>% filter(Dataset == "Rand" & Type == "grouping") %>% 
+              select(new_name, Wave, Type, rule, rev_code, mini, maxi, recode)) %>%
+  filter((is.na(DemDeath) == T | DemDeath > 2006) & Type == "grouping") %>%
+  separate(new_name, c("item", "Year"), sep = "[.]") %>%
+  mutate(new.wave = mapvalues(Year, years, new.waves),
+         value = ifelse(value > 1, 1, value))
+
+pre2006 <- grouping.dat %>%
+  filter(Year <= 2006 & grepl("Ever", item)) %>%
+  separate(item, c("Event", "item"), sep = "_") %>%
+  group_by(PROC_CID, Event) %>% 
+  summarize(remove = sum(value, na.rm = T), 
+            remove = ifelse(remove >=1,1,remove)) %>%
+  filter(remove > 0)
+
+grouping.long <- grouping.dat %>%
+  # filter(pre2006 == 0 & Year >= 2006) %>%
+  filter(!is.na(new.wave)) %>%
+  separate(item, c("Event", "item"), sep = "_") %>%
+  group_by(PROC_CID, Event, new.wave) %>% 
+  summarize(value = sum(value, na.rm = T), 
+            value = ifelse(value >=1,1,value)) %>%
+  spread(key = new.wave, value = value) %>%
+  filter(`1` != 1) %>%
+  mutate(le_value = ifelse(`1` == 0 & rowSums(cbind(`2`, `3`), na.rm = T) > 0, 1, 0))  %>%
+  select(PROC_CID, Event, le_value) %>%
+  spread(key = Event, value = le_value) %>%
+  mutate_all(funs(ifelse(is.na(.) == T | . == 0, 0, 1))) %>%
+  gather(key = Event, value = le_value, -PROC_CID)
+
+```
+
+##Match Subjects Across Data Categories
+```{r match subs, eval = F}
+pers_subs       <- unique(pers.wide$PROC_CID)
+group_subs     <- unique(grouping.long$PROC_CID)
+match_subs     <- unique(match.dat.wide$PROC_CID)
+
+subs           <- match_subs[match_subs %in% group_subs]
+subs           <- subs[subs %in% pers_subs]
+
+match.dat.wide <- match.dat.wide %>% filter(PROC_CID %in% subs)
+pers.wide       <- pers.wide       %>% filter(PROC_CID %in% subs)
+grouping.long  <- grouping.long  %>% filter(PROC_CID %in% subs)
+
+# save(hrs.rand, hrs.paq, file = sprintf("%s/data/base_data.RData", data_path))
+# 
+save(match.dat, match.dat.wide, pers.wide, pers.match, grouping.long, pers.long,
+     file = sprintf("%s/data/data.RData", data_path))
+```
+
+#Multiple Imputation
+##Missing Data Frame
+First, we check the missingness patterns of the match data by converting it to a missing data frame class object using the `missing_data.frame()` function in the `mi` package in `R`. We then use the `image()` function to graphically depict the missingness patterns.
+
+```{r load data}
+load(sprintf("%s/data/data.RData", data_path))
+```
+
+
+```{r}
+big5 <- tibble(
+  old = c("E", "A", "C", "N", "O"),
+  new = c("Extraversion", "Agreeableness", "Conscientiousness", "Neuroticism", "Openness"),
+  colors = c("royalblue", "orange", "maroon2", "springgreen3", "purple")
+)
+events <- tibble(
+  old = c(unique(grouping.long$Event), "none"),
+  new = c("Arthritis", "Cancer", "Diabetes", "Heart Problem", "High BP", "Lung Disease", "Stroke", "None"),
+  breaks = c("Arthritis", "Cancer", "Diabetes", "Heart\nProblem", "High\nBP", "Lung\nDisease", "Stroke", "None")
+)
+```
+
+
+```{r mdf, eval = F}
+# MI doesn't like tibbles, so we need to unclass and reclass the data
+match.dat.wide <- data.frame(unclass(match.dat.wide)) # mi doesn't like tibbles
+
+mdf <- missing_data.frame(match.dat.wide)
+
+pdf(sprintf("%s/plots/%s.pdf", data_path, "mdf"), width = 9, height = 6.5)
+  image(mdf)
+dev.off()
+```
+
+Now, we want to ensure that `missing_data.frame()` has correctly detected the type of variable (nominal, ordinal, etc.), so that missing data will be imputed using the correct link function.  
+```{r change mdf, eval = F}
+des <- describe(match.dat.wide,fast = T)
+
+classes <- tibble(
+  vars = names(mdf@variables),
+  class = combine(lapply(mdf@variables, function(x) class(x)[1]))
+)
+
+mdf <- change(data = mdf, y = rownames(des)[des$range >= 3],
+                   what = "type", to = "continuous")
+mdf <- change(data = mdf, y = classes$vars[classes$class == "SC_proportion"],
+                   what = "type", to = "continuous")
+```
+
+##Multiple Imputation Procedure
+Now, we use the `mi()` function in the `mi` package in to complete the multiple imputation procedure. We create 10 imputed data sets (by setting n.chains to 10) and use 20 iterations for each. We have a lot of variables and a lot of observations, so we use parallel processing to run the procedure.  
+```{r run mi, eval = F}
+mi.res <- mi::mi(mdf, n.chains = 10, n.iter = 20, parallel = T)
+```
+
+Now we compare the missingness patterns before and after imputation and see that we no longer have missing data.  
+```{r mi plot, eval = F}
+pdf(sprintf("%s/plots/%s.pdf", data_path, "mi"), width = 9, height = 6.5)
+image(mi.res)
+dev.off()
+```
+
+And grab the imputed data sets from the MI procedure using the `complete()` function from the `mi` package, which saves them in a list.
+
+```{r extract mi, eval = F}
+complete_fun <- function(mi){
+  clean_fun <- function(df){df %>% select(-contains("missing_"))}
+  tibble(chain = 1:10,
+         imp.data = mi::complete(mi)) %>%
+    mutate(imp.data = map(imp.data, clean_fun)) %>% 
+    unnest(imp.data)
+}
+
+imp.data <- complete_fun(mi.res) %>% 
+  mutate(PROC_CID = ifelse(ceiling(PROC_CID) - PROC_CID > .5, floor(PROC_CID), ceiling(PROC_CID)))
+
+psm.imp.data <- imp.data %>% select(-contains("_2"), -contains("_3"))
+
+bfi.imp <- unique(bfi.long %>% ungroup() %>% select(PROC_CID, sex12:age.c3)) %>%
+  right_join(unique(imp.data %>%
+  select(chain, PROC_CID, A_1:Purpose_3) %>%
+  gather(key = item, value = value, A_1:Purpose_3) %>%
+  separate(item, c("Trait", "new.wave"),sep = "_")))
+
+# save(mdf, mi.res, file = paste(data_path, "results/mi_dat.RData", sep = "/"))
+# save(imp.data, bfi.imp, file = paste(data_path, "results/mi_dat_small.RData", sep = "/"))
+rm("mi.res")
+```
+
+We only need the columns that aren't meant to define missingness patterns, so we write a simple function to do that for each element in the list of imputed data sets. Then we put them into a dataframe in which each of the imputed data sets is saved in a cell of the data frame, which will make it much easier to use for propensity score weighting and growth curve modeling.  
+```{r load mi, eval = F}
+load(paste(data_path, "results/mi_dat_small.RData", sep = "/"))
+psm.imp.data <- imp.data %>% select(-contains("_2"), -contains("_3"))
+nested.psm <- crossing(
+  Event = unique(grouping.long$Event),
+  chain = 1:10,
+  match_set = c("socialization", "selection")
+) 
+```
+
+#Propensity Score Matching
+##Raw Group Demographics  
+```{r raw diff, results = 'asis'}
+options(knitr.kable.NA = '')
+grouping.long %>% 
+  ungroup() %>%
+  full_join(match.dat.wide %>% ungroup() %>% select(PROC_CID, DemDOB, DemGender)) %>%
+  mutate(age = 2006-DemDOB) %>% 
+  filter(!is.na(le_value)) %>%
+  group_by(Event) %>%
+  mutate(m.age = mean(age[le_value == 1], na.rm = T),
+         sd.age = sd(age[le_value == 1], na.rm = T),
+         perc_women = sum(DemGender == 2 & le_value == 1) / 
+           sum(DemGender %in% c(1,2) & le_value == 1)) %>%
+  group_by(Event, le_value, m.age, sd.age, perc_women) %>%
+  dplyr::summarize(n = n()) %>%
+  spread(key = le_value, value = n) %>%
+  mutate(Frequency = sprintf("%.0f (%.0f)", `1`, (`0`))) %>%
+  select(-`0`, -`1`) %>% select(Event, Frequency, everything()) %>%
+  kable(., "html", booktabs = T, escape = F, digits = 2,
+        col.names = c("Life Event", "Frequency", "M", "SD", "% women")) %>%
+  kable_styling(bootstrap_options = c("striped","repeat_header"),full_width = F) %>%
+  #kable_styling(full_width = F) %>%
+  column_spec(1, width = "4cm") %>%
+  add_header_above(c(" " = 2,  "Age in 2006" = 2, " " = 1))
+```
+
+## Run Matching
+Then, we perform propensity score weighting using our imputed datasets using the `twang` package. We then add the weights to our matching data frame, along with our predictor variables. To test the effectiveness of the propensity score weighting procedure, we examine the average standardized effect size in the balance tables. minimal effect sizes are candidates for beng dropped from the propensity score weighting, and large effect sizes mean our weighting procedure wasn't effective.  We can also examine these using balance plots.
+
+```{r psm funs, eval = T}
+# this function actually runs the propensity score weighting procedure
+psm_fun <- function(event, Chain, match_set){
+  print(sprintf("%s Chain %s", event, Chain))
+  #Ratio <- ifelse(event %in% c("ChldMvOut", "ParDied", "Retire", "Unemploy"), 4, 8)
+  Ratio <- 4
+  df <- psm.imp.data %>% filter(chain == Chain) %>% 
+    full_join(grouping.long %>% filter(Event == event) %>%
+                select(Event, PROC_CID, le_value)) %>%
+    select(-chain, -Event) 
+  df <- df[complete.cases(df),]
+  df <- data.frame(unclass(df))
+  if(match_set == "socialization"){to.match <- colnames(df)[-which(colnames(df) %in% c("PROC_SID","le_value"))]} 
+  else {to.match <- colnames(df)[-which(colnames(df) %in% 
+        # c("PROC_SID","le_value", "A_1", "C_1", "E_1", "N_1", "O_1", "PsychPurpose", "CESD_1"))]}
+        c("PROC_SID","le_value", "A_1", "C_1", "E_1", "N_1", "O_1", "Purpose_1", "HlthCESDcomp"))]}
+  match.formula <- as.formula(paste("le_value ~ ", paste(to.match, collapse=" + "), sep = " "))
+  y <- matchit(match.formula, data = df, method = "nearest", ratio = Ratio, caliper = .25)
+}
+
+psm_df <- function(psm){
+  data.frame(match.data(psm))
+}
+
+# this function creates the balance table of the psm weights and filters 
+# the results into variables the matching procedure did not fix and 
+# those that it did
+unbalanced_fun <- function(x){
+  #x <- bal.table(psm)
+  y <- summary(x, standardize = T)
+  raw <- y$sum.all %>%
+    mutate(var = rownames(.)) %>%
+    select(var, `Means Treated`, `Means Control`, `Std. Mean Diff.`)
+  smalldiff.var <- raw %>% filter(abs(`Std. Mean Diff.`) <= .05)
+  matched <- y$sum.matched %>%
+    mutate(var = rownames(.)) %>%
+    select(var, `Means Treated`, `Means Control`, `Std. Mean Diff.`)
+  unbalanced.var <- matched %>% filter(abs(`Std. Mean Diff.`) >= .2)
+  return(list(raw = raw, matched = matched, 
+              unbalanced = unbalanced.var,smalldiff = smalldiff.var))
+}
+
+```
+
+
+
+
+```{r run psm, eval = F}
+print_plot_fun <- function(p, Chain){
+  p$main <- sprintf("Imputed dataset %s", gsub("chain.", "", Chain))
+  p
+}
+
+nested.psm <- nested.psm %>%
+  mutate(# psm with personality
+         psm               = pmap(list(Event, chain, match_set), possibly(psm_fun, NA_real_)),
+         psm.df            = map(psm, possibly(psm_df, NA_real_)),
+         bal.df            = map(psm, possibly(unbalanced_fun, NA_real_)),
+         raw               = map(bal.df, ~.$raw),
+         matched           = map(bal.df, ~.$matched),
+         unbal.tab         = map(bal.df, possibly(~.$unbalanced, NA_real_)),
+         smalldiff.tab     = map(bal.df, possibly(~.$smalldiff, NA_real_)))
+
+# save(nested.psm, file = paste(data_path, "results/psm.RData", sep = "/"))
+nested.psm <- nested.psm %>% select(-psm)
+# save(nested.psm, file = paste(data_path, "results/psm_small.RData", sep = "/"))
+```
+
+
+
+##Balance Plots {.tabset}  
+In these plots, substantial reductions in effect sizes are observed for most variables (blue lines), with only one variable showing an increase in effect size (red lines), but only a seemingly trivial increase. Closed red circles indicate a statistically significant difference, many of which occur before weighting, none after.   
+
+```{r bal plots, eval = T}
+load(sprintf("%s/results/psm_small.RData", res_path))
+plot_fun <- function(df, event, match_set){
+  plot <- df %>%
+    mutate(type = factor(type, level = c("raw", "matched"))) %>%
+    ggplot(aes(x = type, y = `Std. Mean Diff.`)) + 
+    scale_y_continuous(limits = c(-2,2), breaks = seq(-2,2,1)) +
+    geom_point() + 
+    geom_hline(aes(yintercept = 0), linetype = "dashed") +
+    geom_line(aes(group = var), size = .25, alpha = .8) +
+    labs(x = NULL, y = "Standardized Mean Difference", 
+         title = sprintf("%s", event)) +
+    facet_wrap(~chain, ncol = 2) +
+    theme_classic()
+  ggsave(sprintf("%s/results/plots/%s_psw_bal_%s.pdf", res_path, match_set, event), width = 8, height = 10)
+  plot
+}
+
+psm.plots <- nested.psm %>%
+  unnest(raw) %>% mutate(type = "raw") %>%
+  full_join(nested.psm %>% unnest(matched) %>% mutate(type = "matched"))%>%
+  group_by(Event, match_set) %>%
+  nest() %>% 
+  mutate(plot = pmap(list(data, Event, match_set), plot_fun))
+```
+
+```{r, results = 'asis'}
+for (x in 1:length(unique(psm.plots$Event))){
+  cat('\n###', unique(psm.plots$Event)[x], '\n\n  ')
+  print((psm.plots %>% filter(match_set == "socialization"))$plot[[x]])
+}
+```
+
+## Balance Tables
+Once propensity scores are estimated, `bal.table()` produces a table that shows how well the resulting weights succeed in manipulating the groups so that they match on pre-adolescent matching characteristics.  
+
+```{r bal tabs, message = F, warning = F, results = 'asis', eval = T}
+# this table shows variables that are not matched after weighting
+# unbal.tab <- nested.psm %>% 
+#   unnest(unbal.tab, .drop = T) %>% 
+#   group_by(Event, var, match_set) %>% 
+#   #summarize_at(vars(`Means Treated`:`Std. Mean Diff.`), funs(mean(., na.rm = T))) 
+#   summarize(mean = mean(`Std. Mean Diff.`, na.rm = T)) %>%
+#   spread(key = Event, value = mean)
+# kable(unbal.tab, "html", longtable = T, booktabs = T, digits = 2,
+#       caption = "Unbalanced Variables after Propensity Score Weighting") %>%
+#   kable_styling(bootstrap_options = c("striped","repeat_header"),full_width = F)
+  
+# this table shows variables that were already matched prior to weighting
+smalldiff.tab <- nested.psm %>% 
+  unnest(smalldiff.tab, .drop = T) %>% 
+  group_by(Event, var, match_set) %>% 
+  #summarize_at(vars(`Means Treated`:`Std. Mean Diff.`), funs(mean(., na.rm = T))) 
+  summarize(mean = mean(`Std. Mean Diff.`, na.rm = T)) %>%
+  spread(key = Event, value = mean)
+kable(smalldiff.tab, "html", longtable = T, booktabs = T, digits = 2,
+      caption = "Balanced Variables after Propensity Score Weighting") %>%
+  kable_styling(bootstrap_options = c("striped","repeat_header"),full_width = F)
+```
+
+## Raw Group Demographics  
+```{r diff, results = 'asis'}
+load(paste(data_path, "results/psm_small.RData", sep = "/"))
+levs <- paste(rep(c("Unmatched", "Matched"), each = 4), rep(c("Frequency", "m.age", "sd.age", "perc_women"), times = 2), sep = ".")
+options(knitr.kable.NA = '')
+grouping.long %>%
+  ungroup() %>%
+  full_join(
+    match.dat.wide %>% 
+      ungroup() %>% 
+      select(PROC_CID, DemDOB, DemGender)
+    ) %>%
+  mutate(match_set = "Unmatched") %>% 
+  full_join(
+    nested.psm %>% 
+      ungroup() %>%
+      filter(match_set == "socialization" & chain == 1) %>% 
+      mutate(subs = map(psm.df, . %>% select(PROC_CID, le_value))) %>%
+      unnest(subs) %>% select(-chain) %>%
+      left_join(
+        match.dat.wide %>% 
+          ungroup() %>%
+          select(PROC_CID, DemDOB, DemGender))
+  ) %>%
+  mutate(age = 2006-DemDOB, 
+         match_set = mapvalues(match_set, "socialization", "Matched", warn_missing = F)) %>%
+  #select(-le.value)) %>%
+  filter(!is.na(le_value)) %>%
+  group_by(Event, match_set) %>%
+  mutate(m.age = mean(age[le_value == 1], na.rm = T),
+         sd.age = sd(age[le_value == 1], na.rm = T),
+         perc_women = sum(DemGender == 2 & le_value == 1) / 
+           sum(DemGender %in% c(1,2) & le_value == 1)) %>%
+  group_by(Event, match_set, le_value, m.age, sd.age, perc_women) %>%
+  dplyr::summarize(n = n()) %>%
+  ungroup() %>%
+  spread(key = le_value, value = n) %>%
+  mutate(Frequency = sprintf("%.0f (%.0f)", `1`, (`0`))) %>%
+  select(-`0`, -`1`) %>% select(Event, Frequency, everything()) %>%
+  mutate_at(vars(m.age, sd.age), list(~sprintf("%.2f", .))) %>%
+  mutate(perc_women = sprintf("%.2f", perc_women*100)) %>%
+  gather(est, value, -Event, -match_set) %>%
+  unite(tmp, match_set, est, sep = ".") %>%
+  mutate(tmp = factor(tmp, levels = levs)) %>%
+  spread(tmp, value) %>%
+  kable(., "html", booktabs = T, escape = F, 
+        col.names = c("Life Event", rep(c("N", "M", "SD", "% Female"), times = 2)),
+        caption = "Descriptive Statistics for Matched and Unmatched Samples") %>%
+  kable_styling(bootstrap_options = c("striped","repeat_header"),full_width = F) %>%
+  add_header_above(c(" " = 2,  "Age in 2006" = 2, " " = 2,  "Age in 2006" = 2, " " = 1)) %>%
+  add_header_above(c(" " = 1, "Unmatched" = 4, "Matched" = 4)) %>%
+  #kable_styling(full_width = F) %>%
+  column_spec(1, width = "4cm") %>%
+  kableExtra::footnote(general = "Sample sizes in parentheses represent those in the control group, while those oustide parentheses represent the life event groups.")
+```
+
+#Socialization Effects: Growth Models
+## Define Functions {.tabset}
+### Standard Errors
+```{r SE fun}
+# function to get the standard errors
+se_fun <- function(vcov_mat, x, m){
+  print("se_fun")
+  se_map <- function(vcov, parameter, w){
+    z <- 1
+    vcov[parameter, parameter] + 2 * z * vcov[parameter, w] + z^2 * vcov[w, w]
+  }
+  cols <- colnames(vcov_mat)
+  x <- cols[grepl(x,cols) & !grepl(":", cols)]
+  se <- expand.grid(
+    parameter = c("Intercept", x),
+    term = m, 
+    stringsAsFactors = F
+  ) %>% tbl_df() %>%
+    mutate(se = map2_dbl(parameter, term, ~se_map(vcov_mat, .x, .y)),
+           # term = str_replace(term, "groups", ""), 
+           parameter = ifelse(parameter == "Intercept", parameter, "Slope"))
+return(se)
+}
+
+```
+
+### Random Effects  
+```{r}
+# short function for pooling each person's random effects of the models
+pooled_re_fun <- function(m){
+  tmp <- tibble(chain = 1:10,
+         coef = llply(m, function(y){
+           z <- coef(y)$PROC_CID
+           z <- tbl_df(z) %>% mutate(PROC_CID = as.numeric(row.names(z))) }))
+  tmp %>%
+    unnest(coef) %>%
+    group_by(PROC_CID) %>%
+    summarize_at(vars(-chain, -PROC_CID), funs(mean)) 
+}
+```
+
+### vcov
+```{r}
+pool_vcov <- function(model){
+  nvar <- nrow(vcov(model[[1]]))
+  varnames <- str_replace_all(colnames(vcov(model[[1]])), "[()]", "")
+  vcov_sum <- sapply(model, function(z) matrix(vcov(summary(z))@x, nvar))
+  vcov_mean <- matrix(apply(vcov_sum, 1, mean), nrow = nvar)
+  colnames(vcov_mean) <- varnames; rownames(vcov_mean) <- varnames
+  return(vcov_mean)
+}
+```
+
+### Hypotheses  
+```{r}
+hyp_call <- function(fits){
+  tibble(fit = fits) %>%
+    mutate(hypoth = map(fit, hyp_fun)) %>%
+    select(-fit) %>%
+    unnest(hypoth) %>%
+    group_by(term, term.type) %>%
+    summarize_all(mean, na.rm = T)
+}
+
+hyp_fun <- function(fit){
+  print("hyp_fun")
+  me <- 
+    broom.mixed::tidy(fit, conf.int = T) %>%
+    filter(term %in% c("(Intercept)", "new.wave0")) %>%
+    mutate(term.type = mapvalues(term, unique(term), c("(Intercept)", "Slope")),
+           term = "No Event") %>%
+    select(term, term.type, b = estimate, lower = conf.low, upper = conf.high )
+  h <- rbind(
+    c(0,1,0,0),
+    c(0,0,1,0)
+  ); rownames(h) <- c("Slope", "Intercept")
+  h <- confint(multcomp::glht(fit, linfct = h))$confint %>%
+    data.frame() %>%
+    rownames_to_column("term.type") %>%
+    mutate(term = "Event") 
+  me <- h %>% 
+    select(term, term.type, b = Estimate, lower = lwr, upper = upr) %>%
+    full_join(me)
+  return(me)
+}
+```
+
+
+
+### Pooling
+```{r}
+pool_fun <- function(model, pool_re, Event){
+  nchains <- length(model)
+#####
+  ### Get FE's and RE's for pooling FE's across imputations ###
+####
+  fixeffs <- sapply(model, lme4::fixef)
+  raneffs <- sapply(model, function(z) diag(matrix(vcov(summary(z))@x, 
+                                                   nrow(fixeffs))))
+  R2 <- sapply(model, MuMIn::r.squaredGLMM)
+  rownames(raneffs) <- rownames(fixeffs)
+
+  # average effects for each term
+  fixeff_mean <- apply(fixeffs, 1, mean)
+  raneff_mean <- apply(raneffs, 1, mean)
+  R2_mean     <- apply(R2,      1, mean)
+  
+  # variance of fixed effects
+  fixeff_var <- apply(fixeffs, 1, var)
+  
+  T <- raneff_mean + (1 + nchains^(-1)) * fixeff_var # ??
+  r <- (1 + nchains^(-1)) * fixeff_var/raneff_mean# RIV value 
+  df <- (nchains - 1) * (1 + r^(-1))^2
+  se <- sqrt(T)
+  t.val <- fixeff_mean/se
+  p <- 2 * (1 - pt(abs(t.val), df = df))
+  CI = qt(.975, df = df)*se
+  #FMI value fmi <- (r + 2/(df + 3))/(r + 1)
+  
+  CI_fun <- function(mod){
+    CI <- confint.merMod(mod)
+    CI <- data.frame(CI) %>% mutate(term = rownames(.))
+  }
+  
+  # variance and correlation components
+  res <- tibble(chain = 1:10,
+         model = model) %>%
+    mutate(mod_tab = map(model, function(z) {
+      tbl_df(broom::tidy(z)) %>% dplyr::filter(group != "fixed")}),
+      CI = map(model, CI_fun))
+  
+  CI_ran <- res %>% unnest(CI, .drop = T) %>%
+    setNames(c("chain", "CI.lower", "CI.upper", "term")) %>%
+    filter(grepl(".sig", term)) %>%
+    group_by(term) %>%
+    summarize_at(vars(CI.lower, CI.upper), funs(mean)) %>%
+    mutate(term = mapvalues(term, unique(term),
+            c("\\tau_{00}", "\\tau_{10}", "\\tau_{11}", "\\hat{\\sigma^2}")),
+            CI.lower = CI.lower^2, CI.upper = CI.upper^2)
+  raneff <- res %>%
+    unnest(mod_tab, .drop = T) %>% group_by(term, group) %>%
+    summarize(Estimate = mean(estimate, na.rm = T), type = "raneff") %>%
+    ungroup() %>%
+    mutate(term = mapvalues(term, unique(term), c("\\tau_{10}",
+                      "\\tau_{00}", "\\tau_{11}", "\\hat{\\sigma^2}"))) %>%
+    full_join(CI_ran) %>%
+    mutate(CI = ifelse((abs(CI.lower) < .005 | abs(CI.upper) < .005) &
+                       (abs(CI.lower) > .0005 | abs(CI.upper) > .0005),
+                           sprintf("[%.3f, %.3f]", CI.lower, CI.upper),
+                    ifelse((abs(CI.lower) < .0005 | abs(CI.upper) < .0005),
+                           sprintf("[%0.4e, %0.4e]", CI.lower, CI.upper),
+                           sprintf("[%.2f, %.2f]", CI.lower, CI.upper)))) %>%
+    select(-CI.lower, -CI.upper, -group)
+  raneffs <- unique(raneff$term)
+    raneff <- raneff %>%
+      left_join(CI_ran)
+
+  sd_re <- (pool_re %>% 
+    left_join(grouping.long %>% filter(Event == Event) %>% select(PROC_CID, le_value)) %>% 
+    filter(le_value == 0) %>% 
+    summarize(sd = sd(`(Intercept)`, na.rm = T)))$sd
+  
+  fixeff <- tibble(
+    type = rep("fixeff",nrow(fixeffs)),
+    term = rownames(fixeffs),
+    Estimate = fixeff_mean,
+    t = t.val,
+    CI.lower  = fixeff_mean - CI,
+    CI.upper = fixeff_mean + CI,
+    # CI.lower = (res %>% filter(!grepl("sig",term)))$CI.lower,
+    # CI.upper = (res %>% filter(!grepl("sig",term)))$CI.upper,
+    # CI = sprintf("[%.2f, %.2f]", fixeff_mean - CI, fixeff_mean + CI),
+    p = p,
+    d = fixeff_mean/rep(sd_re, length(fixeff_mean))
+  )
+  
+  sum_mod <- tribble(
+    ~type, ~term, ~Estimate,
+    "summary", "R2m", R2_mean["R2m"],
+    "summary", "R2c", R2_mean["R2c"])
+  
+  results <- fixeff %>% full_join(raneff) %>% full_join(sum_mod)
+}
+```
+
+### lme4 Models
+```{r brms fun}
+# function to run, save, and get supporting info on models
+growth_fun <- function(event, trait, matched){
+  df <- lapply(1:10, function(x){
+    print(paste(event, trait, x), sep = " ")
+    if(event == "none"){
+      df <- pers.long %>% ungroup() %>% filter(Trait == trait) %>%
+        mutate(new.wave0 = as.numeric(mapvalues(new.wave, 1:3, 0:2))) 
+    } else if (matched == "matched") {
+     subs <- (nested.psm %>% 
+        filter(Event == event & match_set == "socialization" & chain == x) %>%
+        unnest(psm.df))$PROC_CID
+     df <- pers.long %>% ungroup() %>% 
+        filter(Trait == trait & PROC_CID %in% subs) %>%
+        mutate(new.wave0 = as.numeric(mapvalues(new.wave, 1:3, 0:2))) %>%
+        left_join(grouping.long %>% filter(Event == event)) %>% 
+        mutate(le_value = factor(le_value), chain = x)      
+    } else {
+      df <- pers.long %>% ungroup() %>% 
+        filter(Trait == trait) %>%
+        mutate(new.wave0 = as.numeric(mapvalues(new.wave, 1:3, 0:2))) %>%
+        left_join(grouping.long %>% filter(Event == event)) %>% 
+        mutate(le_value = factor(le_value), chain = x)  
+    }
+  })
+  if(event == "none"){
+    m <- lapply(df, function(x) lme4::lmer(value ~ new.wave0 + + (1 + new.wave0 | PROC_CID),
+                                     data = x))
+  } else{
+    m <- lapply(df, function(x) lme4::lmer(value ~ new.wave0*le_value + + (1 + new.wave0 | PROC_CID),
+                                     data = x))
+  }
+  return(m)
+}
+
+# growth_fun <- function(event, trait, type){
+#   df <- lapply(1:10, function(x){ 
+#     print(paste(event, trait, x), sep = " ")
+#     if(event == "none"){
+#       df <- bfi.imp %>% filter(Trait == trait & chain == x) %>%
+#         mutate(new.wave0 = as.numeric(mapvalues(new.wave, 1:3, 0:2)))
+#     } else{
+#       subs <- unique((nested.psm %>% 
+#         filter(Event == event & match_set == "socialization" & chain == 1) %>%
+#         unnest(psw.df))$PROC_CID)
+#       df <- bfi.imp %>% filter(Trait == trait & chain == x & PROC_CID %in% subs) %>%
+#         mutate(new.wave0 = as.numeric(mapvalues(new.wave, 1:3, 0:2))) %>%
+#         left_join(grouping.long %>% filter(Event == event)) %>% mutate(le_value = factor(le_value))      
+#     }
+#   }) restructure()
+#   if(type == "bayesian"){
+#     if(event == "none"){
+#       fit <- brm_multiple(formula = value  ~ new.wave0 + (1 + new.wave0 | PROC_CID),
+#                           data = df, combine = T, control = list(adapt_delta = 0.99), cores = 3)
+#     } else if (event != "none"){
+#       fit <- brm_multiple(formula = value  ~ new.wave0*le_value + (1 + new.wave0 | PROC_CID),
+#                           data = df, combine = T, control = list(adapt_delta = 0.99), cores = 5)
+#   }
+#   pred <- plot_fun(fit,event)
+#   fixef_pred <- pred$fixed; ranef_pred <- pred$ranef
+#   tab <- pool_fun(fit)
+#   ind_ranef <- tab$raneffs; tab <- tab$tab
+#   vc <- vcov(fit)
+#   se <- if(event != "none"){se_fun(vc, "new.wave0", "le_value1")} else {NA_real_}
+#   h <- hyp_fun(fit, event)
+#   results <- list(fixef_pred = fixef_pred, ranef_pred = ranef_pred, table = tab, 
+#               ranef.tab = ind_ranef, vcov = vc, se = se, hypoth = h)
+#   file2 <- sprintf("%s/results/models/%s_%s_results.RData", data_path, trait, event)
+#   save(results, file = file2)
+#   file <- sprintf("%s/results/models/%s_%s.RData", data_path, trait, event)
+#   save(fit, file = file)
+#   rm(fit)
+#   return(TRUE)
+#   }
+# }
+```
+
+
+## Run Models
+```{r run LGM, eval = F}
+load(sprintf("%s/results/psm_small.RData", data_path))
+load(sprintf("%s/results/mi_dat_small.RData", data_path))
+
+pers_growth <- crossing(
+  Event = c(unique(nested.psm$Event)),
+  Trait = unique(pers.wide$Trait),
+  matched = c("unmatched", "matched")
+  )
+
+pers_growth <- pers_growth %>%
+  filter(Trait == "Purpose") %>%
+  mutate(models = pmap(list(Event, Trait, matched), growth_fun),
+         pooled_re = map(models, possibly(pooled_re_fun, NA_real_)),
+         hypoth = map(models, hyp_call),
+         pool = pmap(list(models, pooled_re, Event), possibly(pool_fun, NA_real_)),
+         pooled_vcov = map(models, possibly(pool_vcov, NA_real_)),
+         pooled_se = map(pooled_vcov, possibly(~se_fun(., "new.wave0", "le_value1"), NA_real_))
+         )
+save(pers_growth, file = sprintf("%s/results/purpose_mods_1.30.RData", data_path))
+```
+
+```{r, eval = F, echo = F}
+pers_growth %>% unnest(pool) %>% filter(term %in% c("new.wave0", "new.wave0:le_value1")) %>%
+  group_by(Event, Trait, matched) %>% summarize(b_none = Estimate[term == "new.wave0"], b_event = sum(Estimate))
+```
+
+# Results  
+## Tables  
+```{r}
+load(sprintf("%s/results/purpose_mods_1.30.RData", res_path))
+```
+
+### Slopes  
+```{r}
+pers_growth %>% 
+  unnest(pool) %>% 
+  filter(term == "new.wave0:le_value1") %>%
+  mutate(CI = sprintf("[%.2f, %.2f]", CI.lower, CI.upper),
+         b = sprintf("%.2f", Estimate)) %>%
+  mutate_at(vars(b, CI), list(~ifelse(p < .05, sprintf("<strong>%s</strong>", .), .))) %>%
+  gather(est, value, b, CI) %>%
+  select(Event, matched, est, value) %>%
+  unite(tmp, matched, est) %>%
+  spread(tmp, value) %>%
+  kable(.
+        , "html"
+        , booktabs = T
+        , escape = F
+        , caption = "Group Differences in Purpose Change"
+        , col.names = c("Event", "b", "CI", "b", "CI")) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(c(" " = 1, "Matched" = 2, "Unmatched" = 2))
+```
+
+### Intercepts  
+```{r}
+pers_growth %>% 
+  unnest(pool) %>% 
+  filter(term == "le_value1") %>%
+  mutate(CI = sprintf("[%.2f, %.2f]", CI.lower, CI.upper),
+         b = sprintf("%.2f", Estimate)) %>%
+  mutate_at(vars(b, CI), list(~ifelse(p < .05, sprintf("<strong>%s</strong>", .), .))) %>%
+  gather(est, value, b, CI) %>%
+  select(Event, matched, est, value) %>%
+  unite(tmp, matched, est) %>%
+  spread(tmp, value) %>%
+  kable(., "html"
+        , booktabs = T
+        , escape = F
+        , caption = "Group Differences in Purpose Level"
+        , col.names = c("Event", "b", "CI", "b", "CI")) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(c(" " = 1, "Matched" = 2, "Unmatched" = 2))
+```
+
+
+## Plots  
+### Average Trajectories  
+```{r}
+mod.mat <- crossing(
+  Intercept = 1, 
+  le_value = c(0,1), 
+  new.wave = seq(0,2,.05)
+) %>%
+  mutate(new.wave_le.value = le_value*new.wave)
+
+pred_fun <- function(x, pv){
+  x <- x %>% as.matrix()
+  frame <- mod.mat %>% as.matrix()
+  mod.mat$y <- as.vector(x %*% t(frame))
+  mod.mat$pv <- pv
+  return(mod.mat)
+}
+
+pv_fun <- function(vcov_mat){
+  df <- mod.mat %>% as.matrix
+  vcov_mat <- vcov_mat[sort(rownames(vcov_mat)),sort(colnames(vcov_mat))]
+  df <- df[,sort(colnames(df))]
+  pv <- diag(df %*% vcov_mat %*% t(df))
+}
+
+plot_fun <- function(x, matched){
+  p <- x %>%
+    ggplot(aes(x = new.wave + 1, y = y, linetype = le_value)) +
+      geom_ribbon(aes(ymin=y-2*SE,ymax=y+2*SE, group = le_value),alpha=0.15,fill="blue") +
+      geom_line(size = 1) +
+      scale_y_continuous(limits = c(1,5), breaks = seq(1,5,1)) +
+      scale_x_continuous(limits = c(1,3), breaks = 1:3) +
+      facet_wrap(~Event, nrow = 2) + 
+      labs(x = "Wave", y = "Estimated Purpose Rating", linetype = NULL,
+           title = sprintf("%s Trajectories", str_to_title(matched))) +
+      theme_classic() +
+      theme(legend.position = "bottom",
+            axis.text = element_text(face = "bold", size = rel(1.2)),
+            axis.title = element_text(face = "bold", size = rel(1.2)),
+            strip.text = element_text(face = "bold", size = rel(1.2), color = "white"),
+            strip.background = element_rect(fill = "black"),
+            plot.title = element_text(face = "bold", hjust = .5))
+  ggsave(p, file = sprintf("%s/results/plots/purpose_trajectories_%s.pdf", res_path, matched), width = 8, height = 5)
+  p
+}
+
+pers_pred <- pers_growth %>%
+  unnest(pool) %>% 
+  filter(type == "fixeff") %>%
+  select(Event, matched, term, Estimate) %>%
+  spread(term, Estimate) %>%
+  group_by(Event, matched) %>%
+  nest() %>%
+  full_join(pers_growth %>% select(Event, matched, pooled_vcov)) %>%
+  mutate(predvar = map(pooled_vcov, pv_fun),
+         pred = map2(data, predvar, pred_fun)) 
+
+pers_sig <- pers_growth %>%
+  unnest(pool) %>%
+  filter(grepl("sigma", term)) %>%
+  select(Event, matched, Estimate)
+  
+plots <- pers_pred %>% 
+  full_join(pers_sig) %>%
+  unnest(pred) %>%
+  mutate(le_value = factor(le_value, levels = c(0,1), labels = c("No Event", "Event")),
+         SE = sqrt(pv),
+         SE2 = sqrt(pv + Estimate)) %>%
+  group_by(matched) %>%
+  nest() %>%
+  mutate(plot = map2(data, matched, plot_fun))
+
+plots$plot
+```
+
+### Spaghetti Plots  
+```{r}
+re_pred_fun <- function(y){
+  x <- crossing(Trait = "Purpose", t.new.wave0 = seq(0,2, .05)) %>%
+    full_join(y %>% select(Trait, t.le_value)) %>%
+    mutate(t.le_value = as.numeric(as.character(t.le_value)),
+           Intercept = 1,
+           int = t.new.wave0*t.le_value) %>%
+    select(Intercept, t.new.wave0, t.le_value, int) %>% 
+    as.matrix()
+  frame <- y %>% select(`(Intercept)`:`new.wave0:le_value1`) %>% distinct() %>% as.matrix()
+  # x <- y %>% select(Intercept, t.new.wave0, t.le_value, int) %>% as.matrix()
+  z <- as.vector(x %*% t(frame))
+  x <- as.data.frame(x) 
+  x$y <- z
+  x
+}
+
+re <- pers_growth %>% 
+  mutate(re_frame = map(models, ~.[[1]]@frame)) %>%
+  select(Event, Trait, re_frame, matched) %>%
+  unnest(re_frame) %>%
+  select(Event:matched, t.le_value = le_value, PROC_CID) %>%
+  distinct() %>%
+  # full_join(crossing(Trait = "Purpose", t.new.wave0 = seq(0,2, .05))) %>%
+  mutate(t.le_value = as.numeric(as.character(t.le_value))) %>%
+  rename(t.new.wave0 = new.wave0) %>%
+  select(Event, Trait, matched, PROC_CID, everything()) %>%
+  #        Intercept = 1, 
+  #        int = t.new.wave0*t.le_value) %>%
+  full_join(
+    pers_growth %>% 
+      select(Event, Trait, matched, pooled_re) %>% 
+      unnest(pooled_re)
+    )
+
+filter_fun <- function(x){
+  subs <- sample(unique(x$PROC_CID), 100)
+  x %>% filter(PROC_CID %in% subs)
+}
+
+re_frame <- re %>%
+  filter(!is.na(t.le_value)) %>%
+  group_by(Event, matched, t.le_value) %>%
+  nest() %>%
+  mutate(data = map(data, filter_fun)) %>%
+  unnest(data) %>%
+  group_by(PROC_CID, Event, matched) %>%
+  nest(.key = "frame") %>%
+  ungroup() %>%
+  mutate(frame = map(frame, re_pred_fun))
+
+re_plot_fun <- function(x, y, matched){
+  p <- x %>%
+    ggplot(aes(x = new.wave + 1, y = y, color = factor(le_value))) +
+      geom_line(aes(group = PROC_CID), size = .25, alpha = .5) +
+      geom_line(aes(linetype = factor(le_value)), data = y, size = 1, color = "black") +
+      scale_color_manual(values = c("springgreen", "blue")) + 
+      scale_y_continuous(limits = c(1,5), breaks = seq(1,5,1)) +
+      scale_x_continuous(limits = c(1,3), breaks = 1:3) +
+      facet_wrap(~Event, nrow = 2) + 
+      labs(x = "Wave", y = "Estimated Purpose Rating", linetype = NULL, color = NULL,
+           title = sprintf("%s Trajectories", str_to_title(matched))) +
+      theme_classic() +
+      theme(legend.position = "bottom",
+            axis.text = element_text(face = "bold", size = rel(1.2)),
+            axis.title = element_text(face = "bold", size = rel(1.2)),
+            strip.text = element_text(face = "bold", size = rel(1.2), color = "white"),
+            strip.background = element_rect(fill = "black"),
+            plot.title = element_text(face = "bold", hjust = .5))
+  ggsave(p, file = sprintf("%s/results/plots/purpose_re_trajectories_%s.pdf", res_path, matched), width = 8, height = 5)
+  p
+}
+
+re_plots <- re_frame %>% 
+  unnest(frame) %>%
+  rename(le_value = t.le_value, new.wave = t.new.wave0) %>%
+  mutate(le_value = factor(le_value, levels = c(0,1), labels = c("No Event", "Event"))) %>%
+  group_by(matched) %>%
+  nest() %>%
+  full_join(plots %>% select(matched, group_data = data)) %>%
+  mutate(plot = pmap(list(data, group_data, matched), re_plot_fun))
+
+re_plots$plot
+```
+
+```{r}
+grouping.long <- pers_growth %>%
+  select(Event, Trait, matched, models) %>%
+  unnest(models) %>% 
+  group_by(Event, Trait, matched) %>%
+  mutate(chain = 1:n()) %>%
+  ungroup() %>%
+  mutate(data = map(models, ~(.)@frame %>% select(le_value, PROC_CID) %>% distinct())) %>%
+  select(-models) %>%
+  unnest(data) %>%
+  select(Event, PROC_CID, le_value) %>%
+  distinct()
+```
+
+
+### Group Slopes  
+```{r}
+ranef_slopes <- pers_growth %>% 
+  select(Event, Trait, matched, pooled_re) %>%
+  unnest(pooled_re) %>%
+  select(Event, Trait, matched, PROC_CID, estimate = new.wave0) %>%
+  left_join(grouping.long %>% ungroup()) %>%
+  mutate(term = mapvalues(le_value, 0:1, c("No Event", "Event")),
+         term.type = "Slope",
+         Event = mapvalues(Event, from = events$old, to = events$new))
+
+pers_growth %>%
+  unnest(hypoth) %>%
+  filter(term.type == "Slope" & Event == "Stroke" & matched == "matched") %>%
+  mutate(Event = mapvalues(Event, from = events$old, to = events$new)) %>%
+  ggplot(aes(x = term, y = b)) +
+    geom_violin(data = ranef_slopes %>% filter(Event == "Stroke"), 
+                aes(y = estimate), alpha = .5, fill = "gray", color = "gray") +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0, position = "dodge") +
+    geom_point(aes(shape = term)) +
+    labs(x = "", y = "Estimated Slope", shape = NULL) +
+    facet_wrap(~Event) +
+    theme_classic() +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "black"),
+          strip.text = element_text(face = "bold", color = "white", size = rel(1.2)), 
+          axis.text = element_text(face = "bold", size = rel(1.2)),
+          axis.title = element_text(face = "bold", size = rel(1.2)),
+          legend.text = element_text(face = "bold", size = rel(1.2)))
+ggsave(file = sprintf("%s/results/plots/Purpose_Stroke_Group_Slopes.pdf", res_path), width = 4, height = 4)
+
+pers_growth %>%
+  unnest(hypoth) %>%
+  filter(term.type == "Slope" & matched == "matched") %>%
+  mutate(Event = mapvalues(Event, from = events$old, to = events$new)) %>%
+  ggplot(aes(x = term, y = b)) +
+    scale_y_continuous(limits = c(-.11, .11), breaks = seq(-.1, .1, .1)) + 
+    geom_violin(data = ranef_slopes, aes(y = estimate), alpha = .5, fill = "gray", color = "gray") +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0, position = "dodge") +
+    geom_point(aes(shape = term), size = 2) +
+    labs(x = "", y = "Estimated Slope", shape = NULL) +
+    facet_wrap(~Event, nrow = 2) +
+    theme_classic() +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "black"),
+          strip.text = element_text(face = "bold", color = "white", size = rel(1.2)), 
+          axis.text = element_text(face = "bold", size = rel(1.2)),
+          axis.title = element_text(face = "bold", size = rel(1.2)),
+          legend.text = element_text(face = "bold", size = rel(1.2)))
+ggsave(file = sprintf("%s/results/plots/Purpose_Group_Slopes.pdf", res_path), width = 10, height = 6)
+
+```
+
+
+
+
